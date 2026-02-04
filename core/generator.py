@@ -126,6 +126,48 @@ def _format_course_name(name: str) -> str:
     return "".join(formatted)
 
 
+def _format_period_value(value: object) -> str:
+    period = parse_period(value)
+    if period is None:
+        return ""
+    return str(period)
+
+
+def _format_correlativo(value: object) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    if text.isdigit():
+        return text.zfill(3)
+    return text
+
+
+def _elective_correlativo_from_code(code: str) -> str | None:
+    code = normalize_str(code)
+    if not code:
+        return None
+    match = re.search(r"AA(\d+)$", code)
+    if not match:
+        return None
+    try:
+        num = int(match.group(1))
+    except ValueError:
+        return None
+    if 1 <= num <= 6:
+        return "{0:03d}".format(48 + num)
+    return None
+
+
+def _resolve_correlativo(rec: dict) -> str:
+    if normalize_str(rec.get("TIPO_CURSO")) == "ELECTIVO":
+        derived = _elective_correlativo_from_code(rec.get("CODIGO_CURSO") or "")
+        if derived:
+            return derived
+    return _format_correlativo(rec.get("Z"))
+
+
 def _format_simple_person_name(name: str) -> tuple[str | None, str | None]:
     name = _normalize_spaces(name)
     if not name:
@@ -252,8 +294,6 @@ def _load_course_metadata(config: dict, config_path: str):
 
     code_col = _resolve_column(df, meta_cfg.get("code_column"), ["CODIGO_CURSO", "CODIGO CURSO", "CODIGO"])
     res_col = _resolve_column(df, meta_cfg.get("resolucion_column"), ["RESOLUCION", "RESOLUCIÓN"])
-    x_col = _resolve_column(df, meta_cfg.get("x_column"), ["X"])
-    y_col = _resolve_column(df, meta_cfg.get("y_column"), ["Y"])
     z_col = _resolve_column(df, meta_cfg.get("z_column"), ["Z"])
 
     missing = []
@@ -261,10 +301,6 @@ def _load_course_metadata(config: dict, config_path: str):
         missing.append("CODIGO_CURSO")
     if not res_col:
         missing.append("RESOLUCION")
-    if not x_col:
-        missing.append("X")
-    if not y_col:
-        missing.append("Y")
     if not z_col:
         missing.append("Z")
     if missing:
@@ -279,8 +315,6 @@ def _load_course_metadata(config: dict, config_path: str):
             continue
         mapping[code] = {
             "resolucion": str(rec.get(res_col) or "").strip(),
-            "x": str(rec.get(x_col) or "").strip(),
-            "y": str(rec.get(y_col) or "").strip(),
             "z": str(rec.get(z_col) or "").strip(),
         }
 
@@ -365,6 +399,41 @@ def _write_identity(ws, identity, header_cells):
         ws.cell(row=row, column=col).value = identity[key]
 
 
+def _merged_anchor(merged_ranges, row: int, col: int) -> tuple[int, int]:
+    if not merged_ranges:
+        return row, col
+    for cell_range in merged_ranges:
+        if (
+            cell_range.min_row <= row <= cell_range.max_row
+            and cell_range.min_col <= col <= cell_range.max_col
+        ):
+            return cell_range.min_row, cell_range.min_col
+    return row, col
+
+
+def _safe_set_cell(ws, row: int, col: int | None, value, merged_ranges) -> None:
+    if not col:
+        return
+    target_row, target_col = _merged_anchor(merged_ranges, row, col)
+    ws.cell(row=target_row, column=target_col).value = value
+
+
+def _clear_course_row(ws, row: int, cols: dict[str, int | None], merged_ranges) -> None:
+    for key in (
+        "code_col",
+        "curso_col",
+        "nota_col",
+        "nota_texto_col",
+        "creditos_col",
+        "acta_col",
+        "resolucion_col",
+        "x_col",
+        "y_col",
+        "z_col",
+    ):
+        _safe_set_cell(ws, row, cols.get(key), None, merged_ranges)
+
+
 def generate_certificates(
     template_path,
     csv_path,
@@ -394,8 +463,6 @@ def generate_certificates(
     df["TIPO_CURSO_N"] = df["TIPO_CURSO"].apply(normalize_str)
     df["NOMBRE_COMPLETO"] = df["NOMBRE_COMPLETO"].fillna("").astype(str).str.strip()
     df["CODIGO_ALUMNO"] = df["CODIGO_ALUMNO"].fillna("").astype(str).str.strip()
-
-    df = df[df["ESTADO_N"] == "APROBADO"]
 
     cara_cfg = config.get("cara", {})
     sello_cfg = config.get("sello", {})
@@ -469,6 +536,7 @@ def generate_certificates(
 
     electives_cfg = config.get("electives", {})
     elective_years = set(electives_cfg.get("years", [6, 7, 8]))
+    approval_years = set(electives_cfg.get("approval_only_years") or range(1, 9))
 
     with open(template_path, "rb") as f:
         template_bytes = f.read()
@@ -526,23 +594,47 @@ def generate_certificates(
             "ESTADO",
             "CODIGO_ALUMNO",
         ]
-        for field in required_fields:
-            if grp[field].isna().any() or (grp[field].astype(str).str.strip() == "").any():
-                errors.append("Campo faltante: {0}".format(field))
 
-        records = grp.to_dict("records")
-        for rec in records:
+        records: list[dict] = []
+        for rec in grp.to_dict("records"):
             rec["CODIGO_CURSO"] = extract_course_code(rec.get("CODIGO"))
             rec["GRADE"] = parse_grade(rec.get("NOTA"))
             rec["YEAR_INT"] = parse_year(rec.get("YEAR"))
+            rec["ESTADO_N"] = normalize_str(rec.get("ESTADO"))
             rec["CURSO_NOMBRE"] = str(rec.get("CURSO") or "").strip()
             rec["CREDITOS"] = str(rec.get("CREDITOS") or "").strip()
             rec["ACTA"] = str(rec.get("ACTA") or "").strip()
             meta = course_metadata.get(rec["CODIGO_CURSO"], {})
             rec["RESOLUCION"] = str(meta.get("resolucion") or "").strip()
-            rec["X"] = str(meta.get("x") or "").strip()
-            rec["Y"] = str(meta.get("y") or "").strip()
             rec["Z"] = str(meta.get("z") or "").strip()
+            rec["PERIODO_VAL"] = _format_period_value(rec.get("PERIODO"))
+            rec["CORRELATIVO"] = _resolve_correlativo(rec)
+
+            year_int = rec.get("YEAR_INT")
+            if year_int in approval_years and rec["ESTADO_N"] != "APROBADO":
+                continue
+
+            records.append(rec)
+
+        period_fallback_by_year: dict[int, str] = {}
+        for rec in records:
+            year_int = rec.get("YEAR_INT")
+            if year_int not in (9, 10):
+                continue
+            period_val = rec.get("PERIODO_VAL") or ""
+            if period_val and year_int not in period_fallback_by_year:
+                period_fallback_by_year[year_int] = period_val
+
+        for rec in records:
+            year_int = rec.get("YEAR_INT")
+            if year_int in (9, 10) and _is_missing(rec.get("PERIODO_VAL")):
+                fallback = period_fallback_by_year.get(year_int, "")
+                if fallback:
+                    rec["PERIODO_VAL"] = fallback
+
+            for field in required_fields:
+                if _is_missing(rec.get(field)):
+                    errors.append("Campo faltante: {0}".format(field))
 
             if _is_missing(rec.get("CODIGO_CURSO")):
                 errors.append("Código de curso vacío")
@@ -552,9 +644,9 @@ def generate_certificates(
                 errors.append("YEAR inválido")
             if _is_missing(rec.get("CURSO_NOMBRE")):
                 errors.append("Curso vacío")
-            if _is_missing(rec.get("RESOLUCION")) or _is_missing(rec.get("X")) or _is_missing(rec.get("Y")) or _is_missing(
-                rec.get("Z")
-            ):
+            if _is_missing(rec.get("PERIODO_VAL")):
+                errors.append("PERIODO inválido")
+            if _is_missing(rec.get("RESOLUCION")) or _is_missing(rec.get("CORRELATIVO")):
                 errors.append(
                     "Sin configuración para curso: {0}".format(rec.get("CODIGO_CURSO"))
                 )
@@ -695,6 +787,7 @@ def generate_certificates(
                 continue
 
             ws = wb[target_sheet]
+            merged_ranges = list(ws.merged_cells.ranges)
             cols = columns_by_sheet[target_sheet]
             sorted_records = sorted(year_records, key=_record_sort_key)
             records_by_code = {rec["CODIGO_CURSO"]: rec for rec in sorted_records}
@@ -709,59 +802,67 @@ def generate_certificates(
                         used_codes.add(template_code)
                         grade = rec["GRADE"]
                         grade_text = grade_to_text(grade)
-                        ws.cell(row=row, column=cols["code_col"]).value = rec["CODIGO_CURSO"]
-                        ws.cell(row=row, column=cols["curso_col"]).value = _format_course_name(
-                            rec.get("CURSO_NOMBRE", "")
+                        _safe_set_cell(ws, row, cols["code_col"], rec["CODIGO_CURSO"], merged_ranges)
+                        _safe_set_cell(
+                            ws,
+                            row,
+                            cols["curso_col"],
+                            _format_course_name(rec.get("CURSO_NOMBRE", "")),
+                            merged_ranges,
                         )
-                        ws.cell(row=row, column=cols["nota_col"]).value = grade
-                        ws.cell(row=row, column=cols["nota_texto_col"]).value = grade_text
-                        if cols.get("creditos_col"):
-                            ws.cell(row=row, column=cols["creditos_col"]).value = rec.get("CREDITOS", "")
-                        if cols.get("acta_col"):
-                            ws.cell(row=row, column=cols["acta_col"]).value = rec.get("ACTA", "")
-                        if cols.get("resolucion_col"):
-                            ws.cell(row=row, column=cols["resolucion_col"]).value = rec.get(
-                                "RESOLUCION", ""
-                            )
-                        if cols.get("x_col"):
-                            ws.cell(row=row, column=cols["x_col"]).value = rec.get("X", "")
-                        if cols.get("y_col"):
-                            ws.cell(row=row, column=cols["y_col"]).value = rec.get("Y", "")
-                        if cols.get("z_col"):
-                            ws.cell(row=row, column=cols["z_col"]).value = rec.get("Z", "")
+                        _safe_set_cell(ws, row, cols["nota_col"], grade, merged_ranges)
+                        _safe_set_cell(ws, row, cols["nota_texto_col"], grade_text, merged_ranges)
+                        _safe_set_cell(
+                            ws, row, cols.get("creditos_col"), rec.get("CREDITOS", ""), merged_ranges
+                        )
+                        _safe_set_cell(ws, row, cols.get("acta_col"), rec.get("ACTA", ""), merged_ranges)
+                        _safe_set_cell(
+                            ws, row, cols.get("resolucion_col"), rec.get("RESOLUCION", ""), merged_ranges
+                        )
+                        _safe_set_cell(
+                            ws, row, cols.get("x_col"), rec.get("PERIODO_VAL", ""), merged_ranges
+                        )
+                        _safe_set_cell(ws, row, cols.get("y_col"), "21", merged_ranges)
+                        _safe_set_cell(
+                            ws, row, cols.get("z_col"), rec.get("CORRELATIVO", ""), merged_ranges
+                        )
                     else:
-                        ws.cell(row=row, column=cols["nota_col"]).value = None
-                        ws.cell(row=row, column=cols["nota_texto_col"]).value = None
+                        _clear_course_row(ws, row, cols, merged_ranges)
                     continue
 
                 while idx < len(sorted_records) and sorted_records[idx]["CODIGO_CURSO"] in used_codes:
                     idx += 1
                 if idx >= len(sorted_records):
-                    break
+                    _clear_course_row(ws, row, cols, merged_ranges)
+                    continue
                 rec = sorted_records[idx]
                 idx += 1
                 used_codes.add(rec["CODIGO_CURSO"])
                 grade = rec["GRADE"]
                 grade_text = grade_to_text(grade)
 
-                ws.cell(row=row, column=cols["code_col"]).value = rec["CODIGO_CURSO"]
-                ws.cell(row=row, column=cols["curso_col"]).value = _format_course_name(
-                    rec.get("CURSO_NOMBRE", "")
+                _safe_set_cell(ws, row, cols["code_col"], rec["CODIGO_CURSO"], merged_ranges)
+                _safe_set_cell(
+                    ws,
+                    row,
+                    cols["curso_col"],
+                    _format_course_name(rec.get("CURSO_NOMBRE", "")),
+                    merged_ranges,
                 )
-                ws.cell(row=row, column=cols["nota_col"]).value = grade
-                ws.cell(row=row, column=cols["nota_texto_col"]).value = grade_text
-                if cols.get("creditos_col"):
-                    ws.cell(row=row, column=cols["creditos_col"]).value = rec.get("CREDITOS", "")
-                if cols.get("acta_col"):
-                    ws.cell(row=row, column=cols["acta_col"]).value = rec.get("ACTA", "")
-                if cols.get("resolucion_col"):
-                    ws.cell(row=row, column=cols["resolucion_col"]).value = rec.get("RESOLUCION", "")
-                if cols.get("x_col"):
-                    ws.cell(row=row, column=cols["x_col"]).value = rec.get("X", "")
-                if cols.get("y_col"):
-                    ws.cell(row=row, column=cols["y_col"]).value = rec.get("Y", "")
-                if cols.get("z_col"):
-                    ws.cell(row=row, column=cols["z_col"]).value = rec.get("Z", "")
+                _safe_set_cell(ws, row, cols["nota_col"], grade, merged_ranges)
+                _safe_set_cell(ws, row, cols["nota_texto_col"], grade_text, merged_ranges)
+                _safe_set_cell(
+                    ws, row, cols.get("creditos_col"), rec.get("CREDITOS", ""), merged_ranges
+                )
+                _safe_set_cell(ws, row, cols.get("acta_col"), rec.get("ACTA", ""), merged_ranges)
+                _safe_set_cell(
+                    ws, row, cols.get("resolucion_col"), rec.get("RESOLUCION", ""), merged_ranges
+                )
+                _safe_set_cell(ws, row, cols.get("x_col"), rec.get("PERIODO_VAL", ""), merged_ranges)
+                _safe_set_cell(ws, row, cols.get("y_col"), "21", merged_ranges)
+                _safe_set_cell(
+                    ws, row, cols.get("z_col"), rec.get("CORRELATIVO", ""), merged_ranges
+                )
 
         safe_name = _sanitize_filename("{0} {1} - {2}".format(dni_str, codigo_alumno, nombre))
         if not safe_name:
