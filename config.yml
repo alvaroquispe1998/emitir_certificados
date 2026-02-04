@@ -1,0 +1,60 @@
+﻿cara:
+  sheet_name: "CARA"
+  header_cells:
+    nombre: "D5"
+    dni: "I5"
+    facultad: "D6"
+    escuela: "D7"
+  course_columns:
+    code_col: "B"
+    curso_col: "D"
+    nota_col: "F"
+    nota_texto_col: "G"
+    resolucion_col: "I"
+    x_col: "N"
+    y_col: "O"
+    z_col: "P"
+
+sello:
+  sheet_name: "SELLO"
+  course_columns:
+    code_col: "B"
+    curso_col: "C"
+    nota_col: "D"
+    nota_texto_col: "E"
+    creditos_col: "F"
+    acta_col: ""
+    resolucion_col: "G"
+    x_col: "L"
+    y_col: "M"
+    z_col: "N"
+
+defaults:
+  facultad: "CIENCIAS DE LA SALUD"
+  escuela: "ENFERMERÍA"
+
+course_metadata:
+  path: "course_metadata.csv"
+  code_column: "CODIGO_CURSO"
+  resolucion_column: "RESOLUCION"
+  x_column: "X"
+  y_column: "Y"
+  z_column: "Z"
+
+optional_courses:
+  - "P02X2153"
+
+# Electivos
+# Si se desea forzar que los electivos se escriban en slots específicos por ciclo,
+# agregue códigos existentes en la plantilla para cada año (en orden de preferencia).
+# Por defecto está vacío y se escribe según el código real del curso.
+electives:
+  years: [6, 7, 8]
+  elective_slots_by_year:
+    "6": []
+    "7": []
+    "8": []
+name_overrides:
+  path: "name_overrides.csv"
+  dni_column: "DNI"
+  comma_after_column: "COMMA_AFTER"
