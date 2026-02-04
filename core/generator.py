@@ -24,6 +24,25 @@ from .zipout import zip_directory
 
 
 INVALID_FILENAME_CHARS = r"\\/:*?\"<>|"
+COURSE_TITLE_STOPWORDS = {
+    "a",
+    "al",
+    "con",
+    "de",
+    "del",
+    "el",
+    "en",
+    "la",
+    "las",
+    "los",
+    "o",
+    "para",
+    "por",
+    "sin",
+    "u",
+    "y",
+    "e",
+}
 
 
 def _load_config(path):
@@ -69,20 +88,35 @@ def _is_roman_numeral(token: str) -> bool:
 def _format_word(token: str) -> str:
     if not token:
         return token
-    if token.isdigit():
+    start = 0
+    end = len(token) - 1
+    while start <= end and not token[start].isalnum():
+        start += 1
+    while end >= start and not token[end].isalnum():
+        end -= 1
+    if start > end:
         return token
-    if _is_roman_numeral(token):
-        return token.upper()
-    if token.isupper() and len(token) <= 3:
-        return token.upper()
-    return token[0].upper() + token[1:].lower()
+
+    leading = token[:start]
+    core = token[start : end + 1]
+    trailing = token[end + 1 :]
+
+    if core.isdigit():
+        return leading + core + trailing
+    if _is_roman_numeral(core):
+        return leading + core.upper() + trailing
+    if core.lower() in COURSE_TITLE_STOPWORDS:
+        return leading + core.lower() + trailing
+    if core.isupper() and len(core) <= 3:
+        return leading + core.upper() + trailing
+    return leading + core[0].upper() + core[1:].lower() + trailing
 
 
 def _format_course_name(name: str) -> str:
     name = _normalize_spaces(name)
     if not name:
         return ""
-    parts = re.split(r"([\\s\\-\\/])", name)
+    parts = re.split(r"([\s\-\/])", name)
     formatted = []
     for part in parts:
         if part in {" ", "-", "/"}:
