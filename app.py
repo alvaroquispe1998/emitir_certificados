@@ -14,7 +14,8 @@ template_file = st.file_uploader("Plantilla .xlsx", type=["xlsx"])
 data_file = st.file_uploader("Data .csv", type=["csv"])
 
 faculty = st.text_input("Facultad", value="CIENCIAS DE LA SALUD")
-program = st.text_input("Programa/Escuela", value="ENFERMERÍA")
+program = st.text_input("Carrera/Programa", value="ENFERMERÍA")
+certificate_date = st.text_input("Fecha (texto libre)", value="")
 
 if st.button("Generar certificados", type="primary"):
     if not template_file or not data_file:
@@ -45,6 +46,7 @@ if st.button("Generar certificados", type="primary"):
                         csv_path=csv_path,
                         faculty=faculty,
                         program=program,
+                        certificate_date=certificate_date,
                         progress_cb=_on_progress,
                     )
                 except Exception as exc:
@@ -53,12 +55,14 @@ if st.button("Generar certificados", type="primary"):
 
                 total = int(log_df.shape[0])
                 ok = int((log_df["STATUS"] == "OK").sum())
+                obs = int((log_df["STATUS"] == "OBSERVADO").sum())
                 err = int((log_df["STATUS"] == "ERROR").sum())
 
-                col1, col2, col3 = st.columns(3)
+                col1, col2, col3, col4 = st.columns(4)
                 col1.metric("Alumnos", total)
                 col2.metric("OK", ok)
-                col3.metric("ERROR", err)
+                col3.metric("OBSERVADO", obs)
+                col4.metric("ERROR", err)
 
                 st.subheader("Log (preview)")
                 st.dataframe(log_df.head(200), use_container_width=True)

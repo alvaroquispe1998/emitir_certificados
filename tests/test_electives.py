@@ -1,10 +1,10 @@
 ﻿from core.electives import balance_electives
 
 
-def test_balance_electives_orders_by_correlative():
+def test_balance_electives_orders_by_code():
     records = [
-        {"YEAR_INT": 7, "PERIODO": "202101", "CODIGO_CURSO": "21AA4"},
-        {"YEAR_INT": 7, "PERIODO": "202001", "CODIGO_CURSO": "21AA1"},
+        {"YEAR_INT": 7, "PERIODO": "202301", "CODIGO_CURSO": "21AA4"},
+        {"YEAR_INT": 7, "PERIODO": "201901", "CODIGO_CURSO": "21AA1"},
         {"YEAR_INT": 8, "PERIODO": "202102", "CODIGO_CURSO": "21AA6"},
     ]
     balanced, error = balance_electives(records, years={6, 7, 8})

@@ -13,26 +13,9 @@ def parse_period(value: object) -> int | None:
     return int("".join(digits))
 
 
-def _parse_correlative(record: dict) -> int | None:
-    for key in ("CORRELATIVO", "Z"):
-        raw = record.get(key)
-        if raw is None:
-            continue
-        text = str(raw).strip()
-        if text.isdigit():
-            return int(text)
-
+def _normalize_code(record: dict) -> str:
     code = str(record.get("CODIGO_CURSO") or record.get("CODIGO") or "").strip().upper()
-    match = re.search(r"AA(\d+)$", code)
-    if not match:
-        return None
-    try:
-        num = int(match.group(1))
-    except ValueError:
-        return None
-    if 1 <= num <= 6:
-        return 48 + num
-    return None
+    return code
 
 
 def balance_electives(records: list[dict], years: set[int] | None = None):
@@ -51,13 +34,10 @@ def balance_electives(records: list[dict], years: set[int] | None = None):
         rec["TARGET_YEAR"] = rec.get("YEAR_INT")
 
     def sort_key(rec):
-        correlative = _parse_correlative(rec)
-        period = parse_period(rec.get("PERIODO"))
+        code = _normalize_code(rec)
         return (
-            correlative is None,
-            correlative or 0,
-            period is None,
-            period or 0,
+            not code,
+            code,
             rec.get("_idx", 0),
         )
 

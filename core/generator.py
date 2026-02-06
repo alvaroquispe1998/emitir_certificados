@@ -3,7 +3,10 @@
 import re
 import tempfile
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import posixpath
+from xml.etree import ElementTree as ET
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import yaml
 from openpyxl import load_workbook
@@ -18,12 +21,20 @@ from .io import (
 )
 from .model_indexer import build_model_index
 from .electives import balance_electives, parse_period
-from .grades import grade_to_text
 from .logger import LogCollector
 from .zipout import zip_directory
 
 
 INVALID_FILENAME_CHARS = r"\\/:*?\"<>|"
+NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+NS_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+NS_PKG_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
+NS_XDR = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+REL_TYPE_DRAWING = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing"
+
+ET.register_namespace("", NS_MAIN)
+ET.register_namespace("r", NS_REL)
 COURSE_TITLE_STOPWORDS = {
     "a",
     "al",
@@ -131,6 +142,17 @@ def _format_period_value(value: object) -> str:
     if period is None:
         return ""
     return str(period)
+
+
+def _parse_resolution_flag(value: object) -> tuple[bool, str | None]:
+    text = normalize_str(value)
+    if not text:
+        return True, None
+    if text in {"SI", "SÍ", "S"}:
+        return True, None
+    if text in {"NO", "N"}:
+        return False, None
+    return True, "Valor inválido en columna RESOLUCION: '{0}' (use SI o NO)".format(value)
 
 
 def _format_correlativo(value: object) -> str:
@@ -392,11 +414,20 @@ def _write_identity(ws, identity, header_cells):
         except Exception:
             missing.append("ESCUELA")
 
+    date_coord = header_cells.get("fecha")
+    if date_coord:
+        try:
+            col_letter, row = coordinate_from_string(date_coord)
+            col = column_index_from_string(col_letter)
+            positions["FECHA"] = (row, col)
+        except Exception:
+            missing.append("FECHA")
+
     if missing:
         raise ValueError("No se pudo ubicar campos de cabecera: {0}".format(", ".join(missing)))
 
     for key, (row, col) in positions.items():
-        ws.cell(row=row, column=col).value = identity[key]
+        ws.cell(row=row, column=col).value = identity.get(key, "")
 
 
 def _merged_anchor(merged_ranges, row: int, col: int) -> tuple[int, int]:
@@ -418,6 +449,26 @@ def _safe_set_cell(ws, row: int, col: int | None, value, merged_ranges) -> None:
     ws.cell(row=target_row, column=target_col).value = value
 
 
+def _grade_for_output(grade: int | None):
+    if grade == 0:
+        return None
+    return grade
+
+
+def _resolution_output_value(
+    rec: dict, x_ref: str | None = None, y_ref: str | None = None, z_ref: str | None = None
+) -> str:
+    if rec.get("USA_RESOLUCION", True):
+        return rec.get("RESOLUCION_TEXTO", "")
+    if x_ref and y_ref and z_ref:
+        return "=+CONCATENATE({0},{1},{2})".format(x_ref, y_ref, z_ref)
+    return "{0}{1}{2}".format(
+        rec.get("PERIODO_VAL", ""),
+        "21",
+        rec.get("CORRELATIVO", ""),
+    )
+
+
 def _clear_course_row(ws, row: int, cols: dict[str, int | None], merged_ranges) -> None:
     for key in (
         "code_col",
@@ -434,6 +485,164 @@ def _clear_course_row(ws, row: int, cols: dict[str, int | None], merged_ranges) 
         _safe_set_cell(ws, row, cols.get(key), None, merged_ranges)
 
 
+def _worksheet_rel_path(sheet_path: str) -> str:
+    prefix, name = sheet_path.rsplit("/", 1)
+    return "{0}/_rels/{1}.rels".format(prefix, name)
+
+
+def _resolve_part(base_part: str, target: str) -> str:
+    if target.startswith("/"):
+        return target.lstrip("/")
+    base_dir = PurePosixPath(base_part).parent
+    return posixpath.normpath(str(PurePosixPath(base_dir, target)))
+
+
+def _sheet_paths_from_workbook(template_entries: dict[str, bytes]) -> dict[str, str]:
+    workbook = ET.fromstring(template_entries["xl/workbook.xml"])
+    rels = ET.fromstring(template_entries["xl/_rels/workbook.xml.rels"])
+    rel_targets: dict[str, str] = {}
+    for rel in rels.findall("{%s}Relationship" % NS_PKG_REL):
+        rel_targets[rel.attrib.get("Id", "")] = rel.attrib.get("Target", "")
+
+    paths: dict[str, str] = {}
+    for sheet in workbook.findall(".//{%s}sheet" % NS_MAIN):
+        name = sheet.attrib.get("name", "")
+        rid = sheet.attrib.get("{%s}id" % NS_REL, "")
+        target = rel_targets.get(rid, "")
+        if not name or not target:
+            continue
+        paths[name] = _resolve_part("xl/workbook.xml", target)
+    return paths
+
+
+def _apply_date_to_drawing_xml(xml_bytes: bytes, certificate_date: str) -> bytes:
+    if not certificate_date.strip():
+        return xml_bytes
+    root = ET.fromstring(xml_bytes)
+    shape_nodes = root.findall(".//{%s}sp" % NS_XDR)
+    for shape in shape_nodes:
+        texts = shape.findall(".//{%s}t" % NS_A)
+        merged = "".join([(node.text or "") for node in texts]).strip().lower()
+        if not merged:
+            continue
+        if re.search(r"\d{1,2}\s+de\s+.+\s+del\s+\d{4}", merged):
+            texts[0].text = certificate_date
+            for extra in texts[1:]:
+                extra.text = ""
+            return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+    if shape_nodes:
+        texts = shape_nodes[0].findall(".//{%s}t" % NS_A)
+        if texts:
+            texts[0].text = certificate_date
+            for extra in texts[1:]:
+                extra.text = ""
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def _copy_template_drawings(
+    template_path: Path, output_path: Path, certificate_date: str
+) -> None:
+    with ZipFile(template_path, "r") as z_tpl:
+        template_entries = {name: z_tpl.read(name) for name in z_tpl.namelist()}
+    with ZipFile(output_path, "r") as z_out:
+        out_entries = {name: z_out.read(name) for name in z_out.namelist()}
+
+    sheet_paths = _sheet_paths_from_workbook(template_entries)
+    drawing_parts: set[str] = set()
+
+    for _sheet_name, sheet_path in sheet_paths.items():
+        tpl_sheet_xml = template_entries.get(sheet_path)
+        out_sheet_xml = out_entries.get(sheet_path)
+        if not tpl_sheet_xml or not out_sheet_xml:
+            continue
+
+        tpl_sheet = ET.fromstring(tpl_sheet_xml)
+        out_sheet = ET.fromstring(out_sheet_xml)
+
+        tpl_drawings = tpl_sheet.findall("{%s}drawing" % NS_MAIN)
+        if not tpl_drawings:
+            continue
+
+        existing_rids = {
+            node.attrib.get("{%s}id" % NS_REL, "")
+            for node in out_sheet.findall("{%s}drawing" % NS_MAIN)
+        }
+        changed_sheet = False
+        for tpl_drawing in tpl_drawings:
+            rid = tpl_drawing.attrib.get("{%s}id" % NS_REL, "")
+            if rid in existing_rids:
+                continue
+            out_sheet.append(ET.fromstring(ET.tostring(tpl_drawing, encoding="utf-8")))
+            changed_sheet = True
+        if changed_sheet:
+            out_entries[sheet_path] = ET.tostring(out_sheet, encoding="utf-8", xml_declaration=True)
+
+        rel_path = _worksheet_rel_path(sheet_path)
+        tpl_rels_xml = template_entries.get(rel_path)
+        if not tpl_rels_xml:
+            continue
+
+        tpl_rels = ET.fromstring(tpl_rels_xml)
+        out_rels = ET.fromstring(out_entries[rel_path]) if rel_path in out_entries else ET.Element(
+            "{%s}Relationships" % NS_PKG_REL
+        )
+
+        existing_rel_ids = {
+            rel.attrib.get("Id", "") for rel in out_rels.findall("{%s}Relationship" % NS_PKG_REL)
+        }
+        rels_changed = False
+        for rel in tpl_rels.findall("{%s}Relationship" % NS_PKG_REL):
+            if rel.attrib.get("Type") != REL_TYPE_DRAWING:
+                continue
+            rel_id = rel.attrib.get("Id", "")
+            target = rel.attrib.get("Target", "")
+            if rel_id not in existing_rel_ids:
+                out_rels.append(ET.fromstring(ET.tostring(rel, encoding="utf-8")))
+                rels_changed = True
+            if target:
+                drawing_parts.add(_resolve_part(sheet_path, target))
+
+        if rels_changed or rel_path not in out_entries:
+            out_entries[rel_path] = ET.tostring(out_rels, encoding="utf-8", xml_declaration=True)
+
+    for drawing_part in sorted(drawing_parts):
+        if drawing_part not in template_entries:
+            continue
+        data = template_entries[drawing_part]
+        if drawing_part.endswith(".xml"):
+            data = _apply_date_to_drawing_xml(data, certificate_date)
+        out_entries[drawing_part] = data
+
+        rel_part = _worksheet_rel_path(drawing_part)
+        if rel_part in template_entries:
+            out_entries[rel_part] = template_entries[rel_part]
+
+    tpl_ct = ET.fromstring(template_entries["[Content_Types].xml"])
+    out_ct = ET.fromstring(out_entries["[Content_Types].xml"])
+    existing_parts = {
+        node.attrib.get("PartName", "")
+        for node in out_ct.findall("{http://schemas.openxmlformats.org/package/2006/content-types}Override")
+    }
+    ct_changed = False
+    for node in tpl_ct.findall("{http://schemas.openxmlformats.org/package/2006/content-types}Override"):
+        part_name = node.attrib.get("PartName", "")
+        if not part_name.startswith("/xl/drawings/"):
+            continue
+        if part_name in existing_parts:
+            continue
+        out_ct.append(ET.fromstring(ET.tostring(node, encoding="utf-8")))
+        ct_changed = True
+    if ct_changed:
+        out_entries["[Content_Types].xml"] = ET.tostring(out_ct, encoding="utf-8", xml_declaration=True)
+
+    temp_path = output_path.with_suffix(".tmp.xlsx")
+    with ZipFile(temp_path, "w", ZIP_DEFLATED) as z_new:
+        for name, data in out_entries.items():
+            z_new.writestr(name, data)
+    temp_path.replace(output_path)
+
+
 def generate_certificates(
     template_path,
     csv_path,
@@ -441,13 +650,9 @@ def generate_certificates(
     program,
     config_path="config.yml",
     progress_cb=None,
+    certificate_date="",
 ):
     config = _load_config(config_path)
-    optional_codes = {
-        extract_course_code(code)
-        for code in (config.get("optional_courses") or [])
-        if str(code).strip()
-    }
     course_metadata = _load_course_metadata(config, config_path)
     name_overrides, name_overrides_path = _load_name_overrides(config, config_path)
     df = read_csv(csv_path)
@@ -463,6 +668,15 @@ def generate_certificates(
     df["TIPO_CURSO_N"] = df["TIPO_CURSO"].apply(normalize_str)
     df["NOMBRE_COMPLETO"] = df["NOMBRE_COMPLETO"].fillna("").astype(str).str.strip()
     df["CODIGO_ALUMNO"] = df["CODIGO_ALUMNO"].fillna("").astype(str).str.strip()
+    resolution_flag_col = _resolve_column(
+        df,
+        None,
+        ["RESOLUCION_FLAG", "RESOLUCION", "RESOLUCIÓN", "RESOLUCIO"],
+    )
+    if resolution_flag_col:
+        df["_RESOLUTION_FLAG"] = df[resolution_flag_col]
+    else:
+        df["_RESOLUTION_FLAG"] = ""
 
     cara_cfg = config.get("cara", {})
     sello_cfg = config.get("sello", {})
@@ -582,12 +796,23 @@ def generate_certificates(
         if not _is_valid_dni(dni_str):
             errors.append("DNI vacío o no numérico")
 
+        student_resolution_raw = ""
+        if "_RESOLUTION_FLAG" in grp.columns:
+            for value in grp["_RESOLUTION_FLAG"].tolist():
+                if str(value or "").strip():
+                    student_resolution_raw = value
+                    break
+        student_use_resolution, student_resolution_error = _parse_resolution_flag(
+            student_resolution_raw
+        )
+        if student_resolution_error:
+            errors.append(student_resolution_error)
+
         required_fields = [
             "DNI",
             "NOMBRE_COMPLETO",
             "CODIGO",
             "CURSO",
-            "NOTA",
             "YEAR",
             "TIPO_CURSO",
             "PERIODO",
@@ -596,19 +821,24 @@ def generate_certificates(
         ]
 
         records: list[dict] = []
+        records_all: list[dict] = []
         for rec in grp.to_dict("records"):
             rec["CODIGO_CURSO"] = extract_course_code(rec.get("CODIGO"))
             rec["GRADE"] = parse_grade(rec.get("NOTA"))
             rec["YEAR_INT"] = parse_year(rec.get("YEAR"))
             rec["ESTADO_N"] = normalize_str(rec.get("ESTADO"))
+            rec["USA_RESOLUCION"] = student_use_resolution
+            rec["RESOLUCION_FLAG_ERROR"] = student_resolution_error
             rec["CURSO_NOMBRE"] = str(rec.get("CURSO") or "").strip()
             rec["CREDITOS"] = str(rec.get("CREDITOS") or "").strip()
             rec["ACTA"] = str(rec.get("ACTA") or "").strip()
             meta = course_metadata.get(rec["CODIGO_CURSO"], {})
-            rec["RESOLUCION"] = str(meta.get("resolucion") or "").strip()
+            rec["RESOLUCION_TEXTO"] = str(meta.get("resolucion") or "").strip()
             rec["Z"] = str(meta.get("z") or "").strip()
             rec["PERIODO_VAL"] = _format_period_value(rec.get("PERIODO"))
             rec["CORRELATIVO"] = _resolve_correlativo(rec)
+
+            records_all.append(rec)
 
             year_int = rec.get("YEAR_INT")
             if year_int in approval_years and rec["ESTADO_N"] != "APROBADO":
@@ -638,18 +868,18 @@ def generate_certificates(
 
             if _is_missing(rec.get("CODIGO_CURSO")):
                 errors.append("Código de curso vacío")
-            if rec.get("GRADE") is None:
-                errors.append("Nota inválida")
             if rec.get("YEAR_INT") is None:
                 errors.append("YEAR inválido")
             if _is_missing(rec.get("CURSO_NOMBRE")):
                 errors.append("Curso vacío")
             if _is_missing(rec.get("PERIODO_VAL")):
                 errors.append("PERIODO inválido")
-            if _is_missing(rec.get("RESOLUCION")) or _is_missing(rec.get("CORRELATIVO")):
-                errors.append(
-                    "Sin configuración para curso: {0}".format(rec.get("CODIGO_CURSO"))
-                )
+            if rec.get("RESOLUCION_FLAG_ERROR"):
+                errors.append(rec["RESOLUCION_FLAG_ERROR"])
+            if _is_missing(rec.get("CORRELATIVO")):
+                errors.append("Sin correlativo (Z) para curso: {0}".format(rec.get("CODIGO_CURSO")))
+            if rec.get("USA_RESOLUCION", True) and _is_missing(rec.get("RESOLUCION_TEXTO")):
+                errors.append("Sin resolución para curso: {0}".format(rec.get("CODIGO_CURSO")))
 
         def _deduplicate_records(items: list[dict]) -> list[dict]:
             best: dict[tuple[int | None, str], dict] = {}
@@ -684,6 +914,16 @@ def generate_certificates(
 
         records = _deduplicate_records(records)
 
+        approved_grade_by_code: dict[str, int] = {}
+        for rec in records:
+            code = str(rec.get("CODIGO_CURSO") or "").strip()
+            grade = rec.get("GRADE")
+            if not code:
+                continue
+            if grade is None or grade == 0:
+                continue
+            approved_grade_by_code[code] = int(grade)
+
         electives = [
             rec
             for rec in records
@@ -696,7 +936,7 @@ def generate_certificates(
                 codigo_alumno,
                 nombre,
                 "ERROR",
-                "El alumno no tiene exactamente 3 electivos aprobados",
+                "El alumno tiene {0} electivos aprobados (se requieren 3)".format(len(electives)),
                 "",
             )
             processed_students += 1
@@ -715,21 +955,25 @@ def generate_certificates(
         for rec in balanced:
             rec["YEAR_INT"] = rec.get("TARGET_YEAR")
 
-        # Los slots configurados se mantienen en config.yml, pero no se usan para escribir.
+        electives_by_year: dict[int, list[dict]] = {}
+        fixed_by_year: dict[int, list[dict]] = {}
+        years_with_records: set[int] = set()
 
-        missing_reasons = []
-        records_by_year: dict[int, list[dict]] = {}
         for rec in records:
             year = rec.get("YEAR_INT")
+            if year is None:
+                continue
+            years_with_records.add(year)
+            if normalize_str(rec.get("TIPO_CURSO")) == "ELECTIVO" and year in elective_years:
+                electives_by_year.setdefault(year, []).append(rec)
+            else:
+                fixed_by_year.setdefault(year, []).append(rec)
+
+        missing_reasons = []
+        for year in sorted(years_with_records):
             target_sheet = _select_sheet(year, cara_sheet, sello_sheet)
             if not target_sheet:
                 missing_reasons.append("YEAR fuera de rango (1-10): {0}".format(year))
-                continue
-            records_by_year.setdefault(year, []).append(rec)
-
-        for year, year_records in records_by_year.items():
-            target_sheet = _select_sheet(year, cara_sheet, sello_sheet)
-            if not target_sheet:
                 continue
             sheet_slots = slots_by_sheet.get(target_sheet, {})
             rows = sheet_slots.get(year)
@@ -738,10 +982,11 @@ def generate_certificates(
                     "No hay filas para YEAR={0} en {1}".format(year, target_sheet)
                 )
                 continue
-            if len(year_records) > len(rows):
+            electives_for_year = electives_by_year.get(year, [])
+            if electives_for_year and len(rows) < len(electives_for_year):
                 missing_reasons.append(
-                    "No hay suficientes filas en {0} para YEAR={1}: {2} cursos, {3} filas".format(
-                        target_sheet, year, len(year_records), len(rows)
+                    "No hay suficientes filas en {0} para YEAR={1}: {2} electivos, {3} filas".format(
+                        target_sheet, year, len(electives_for_year), len(rows)
                     )
                 )
 
@@ -759,6 +1004,7 @@ def generate_certificates(
             "NOMBRE": nombre_formateado or nombre,
             "FACULTAD": faculty,
             "PROGRAMA": program,
+            "FECHA": certificate_date,
         }
 
         try:
@@ -773,51 +1019,104 @@ def generate_certificates(
                 progress_cb(processed_students, total_students)
             continue
 
-        def _record_sort_key(rec: dict):
-            period = parse_period(rec.get("PERIODO"))
-            code = rec.get("CODIGO_CURSO") or ""
-            return (period is None, period or 0, code)
+        def _elective_code_key(rec: dict) -> str:
+            return str(rec.get("CODIGO_CURSO") or rec.get("CODIGO") or "").strip().upper()
 
-        for year, year_records in records_by_year.items():
-            target_sheet = _select_sheet(year, cara_sheet, sello_sheet)
-            if not target_sheet:
-                continue
-            rows = slots_by_sheet.get(target_sheet, {}).get(year, [])
-            if not rows:
-                continue
+        name_by_code: dict[str, str] = {}
+        for rec in records_all:
+            code = str(rec.get("CODIGO_CURSO") or "").strip()
+            name = _normalize_spaces(rec.get("CURSO_NOMBRE") or "")
+            if code and name and code not in name_by_code:
+                name_by_code[code] = name
 
+        template_codes_by_year: dict[int, set[str]] = {}
+        for sheet_name, sheet_slots in slots_by_sheet.items():
+            ws = wb[sheet_name]
+            code_col = columns_by_sheet[sheet_name]["code_col"]
+            for year, rows in sheet_slots.items():
+                for row in rows:
+                    code = extract_course_code(ws.cell(row=row, column=code_col).value)
+                    if code:
+                        template_codes_by_year.setdefault(year, set()).add(code)
+
+        electives_used_by_year: dict[int, list[dict]] = {}
+        for year in elective_years:
+            electives_used_by_year[year] = sorted(
+                electives_by_year.get(year, []), key=_elective_code_key
+            )
+
+        observed_codes: set[str] = set()
+        for year, codes in template_codes_by_year.items():
+            for code in codes:
+                if not code:
+                    continue
+                if code in approved_grade_by_code:
+                    continue
+                has_missing = False
+                for rec in records_all:
+                    if str(rec.get("CODIGO_CURSO") or "").strip() != code:
+                        continue
+                    grade = rec.get("GRADE")
+                    if grade is None or grade == 0:
+                        has_missing = True
+                        break
+                if has_missing:
+                    observed_codes.add(code)
+
+        elective_codes: set[str] = set()
+        for rec in records_all:
+            if normalize_str(rec.get("TIPO_CURSO")) != "ELECTIVO":
+                continue
+            code = str(rec.get("CODIGO_CURSO") or "").strip()
+            if code:
+                elective_codes.add(code)
+        observed_codes.difference_update(elective_codes)
+
+        observed_courses: list[str] = []
+        for code in sorted(observed_codes):
+            name = name_by_code.get(code, "")
+            if name:
+                observed_courses.append("{0} - {1}".format(code, name))
+            else:
+                observed_courses.append(code)
+
+        for target_sheet, sheet_slots in slots_by_sheet.items():
             ws = wb[target_sheet]
             merged_ranges = list(ws.merged_cells.ranges)
             cols = columns_by_sheet[target_sheet]
-            sorted_records = sorted(year_records, key=_record_sort_key)
-            records_by_code = {rec["CODIGO_CURSO"]: rec for rec in sorted_records}
-            used_codes: set[str] = set()
 
-            idx = 0
-            for row in rows:
-                template_code = extract_course_code(ws.cell(row=row, column=cols["code_col"]).value)
-                if template_code and template_code in optional_codes:
-                    rec = records_by_code.get(template_code)
+            for year, rows in sheet_slots.items():
+                if not rows:
+                    continue
+
+                fixed_records = fixed_by_year.get(year, [])
+                fixed_by_code = {rec.get("CODIGO_CURSO"): rec for rec in fixed_records}
+
+                electives_sorted = electives_used_by_year.get(year, [])
+                elective_count = len(electives_sorted)
+                elective_rows = rows[-elective_count:] if elective_count else []
+                fixed_rows = rows[:-elective_count] if elective_count else rows
+
+                for row in fixed_rows:
+                    template_code = extract_course_code(
+                        ws.cell(row=row, column=cols["code_col"]).value
+                    )
+                    rec = fixed_by_code.get(template_code)
+                    grade = _grade_for_output(rec.get("GRADE") if rec else None)
+                    _safe_set_cell(ws, row, cols["nota_col"], grade, merged_ranges)
                     if rec:
-                        used_codes.add(template_code)
-                        grade = rec["GRADE"]
-                        grade_text = grade_to_text(grade)
-                        _safe_set_cell(ws, row, cols["code_col"], rec["CODIGO_CURSO"], merged_ranges)
+                        x_col = cols.get("x_col")
+                        y_col = cols.get("y_col")
+                        z_col = cols.get("z_col")
+                        x_ref = "{0}{1}".format(get_column_letter(x_col), row) if x_col else None
+                        y_ref = "{0}{1}".format(get_column_letter(y_col), row) if y_col else None
+                        z_ref = "{0}{1}".format(get_column_letter(z_col), row) if z_col else None
                         _safe_set_cell(
                             ws,
                             row,
-                            cols["curso_col"],
-                            _format_course_name(rec.get("CURSO_NOMBRE", "")),
+                            cols.get("resolucion_col"),
+                            _resolution_output_value(rec, x_ref, y_ref, z_ref),
                             merged_ranges,
-                        )
-                        _safe_set_cell(ws, row, cols["nota_col"], grade, merged_ranges)
-                        _safe_set_cell(ws, row, cols["nota_texto_col"], grade_text, merged_ranges)
-                        _safe_set_cell(
-                            ws, row, cols.get("creditos_col"), rec.get("CREDITOS", ""), merged_ranges
-                        )
-                        _safe_set_cell(ws, row, cols.get("acta_col"), rec.get("ACTA", ""), merged_ranges)
-                        _safe_set_cell(
-                            ws, row, cols.get("resolucion_col"), rec.get("RESOLUCION", ""), merged_ranges
                         )
                         _safe_set_cell(
                             ws, row, cols.get("x_col"), rec.get("PERIODO_VAL", ""), merged_ranges
@@ -826,43 +1125,42 @@ def generate_certificates(
                         _safe_set_cell(
                             ws, row, cols.get("z_col"), rec.get("CORRELATIVO", ""), merged_ranges
                         )
-                    else:
-                        _clear_course_row(ws, row, cols, merged_ranges)
-                    continue
 
-                while idx < len(sorted_records) and sorted_records[idx]["CODIGO_CURSO"] in used_codes:
-                    idx += 1
-                if idx >= len(sorted_records):
-                    _clear_course_row(ws, row, cols, merged_ranges)
-                    continue
-                rec = sorted_records[idx]
-                idx += 1
-                used_codes.add(rec["CODIGO_CURSO"])
-                grade = rec["GRADE"]
-                grade_text = grade_to_text(grade)
-
-                _safe_set_cell(ws, row, cols["code_col"], rec["CODIGO_CURSO"], merged_ranges)
-                _safe_set_cell(
-                    ws,
-                    row,
-                    cols["curso_col"],
-                    _format_course_name(rec.get("CURSO_NOMBRE", "")),
-                    merged_ranges,
-                )
-                _safe_set_cell(ws, row, cols["nota_col"], grade, merged_ranges)
-                _safe_set_cell(ws, row, cols["nota_texto_col"], grade_text, merged_ranges)
-                _safe_set_cell(
-                    ws, row, cols.get("creditos_col"), rec.get("CREDITOS", ""), merged_ranges
-                )
-                _safe_set_cell(ws, row, cols.get("acta_col"), rec.get("ACTA", ""), merged_ranges)
-                _safe_set_cell(
-                    ws, row, cols.get("resolucion_col"), rec.get("RESOLUCION", ""), merged_ranges
-                )
-                _safe_set_cell(ws, row, cols.get("x_col"), rec.get("PERIODO_VAL", ""), merged_ranges)
-                _safe_set_cell(ws, row, cols.get("y_col"), "21", merged_ranges)
-                _safe_set_cell(
-                    ws, row, cols.get("z_col"), rec.get("CORRELATIVO", ""), merged_ranges
-                )
+                for row, rec in zip(elective_rows, electives_sorted):
+                    grade = _grade_for_output(rec.get("GRADE"))
+                    x_col = cols.get("x_col")
+                    y_col = cols.get("y_col")
+                    z_col = cols.get("z_col")
+                    x_ref = "{0}{1}".format(get_column_letter(x_col), row) if x_col else None
+                    y_ref = "{0}{1}".format(get_column_letter(y_col), row) if y_col else None
+                    z_ref = "{0}{1}".format(get_column_letter(z_col), row) if z_col else None
+                    _safe_set_cell(ws, row, cols["code_col"], rec.get("CODIGO_CURSO"), merged_ranges)
+                    _safe_set_cell(
+                        ws,
+                        row,
+                        cols["curso_col"],
+                        _format_course_name(rec.get("CURSO_NOMBRE", "")),
+                        merged_ranges,
+                    )
+                    _safe_set_cell(ws, row, cols["nota_col"], grade, merged_ranges)
+                    _safe_set_cell(
+                        ws, row, cols.get("creditos_col"), rec.get("CREDITOS", ""), merged_ranges
+                    )
+                    _safe_set_cell(ws, row, cols.get("acta_col"), rec.get("ACTA", ""), merged_ranges)
+                    _safe_set_cell(
+                        ws,
+                        row,
+                        cols.get("resolucion_col"),
+                        _resolution_output_value(rec, x_ref, y_ref, z_ref),
+                        merged_ranges,
+                    )
+                    _safe_set_cell(
+                        ws, row, cols.get("x_col"), rec.get("PERIODO_VAL", ""), merged_ranges
+                    )
+                    _safe_set_cell(ws, row, cols.get("y_col"), "21", merged_ranges)
+                    _safe_set_cell(
+                        ws, row, cols.get("z_col"), rec.get("CORRELATIVO", ""), merged_ranges
+                    )
 
         safe_name = _sanitize_filename("{0} {1} - {2}".format(dni_str, codigo_alumno, nombre))
         if not safe_name:
@@ -870,8 +1168,14 @@ def generate_certificates(
 
         out_path = cert_dir / "{0}.xlsx".format(safe_name)
         wb.save(out_path)
+        _copy_template_drawings(Path(template_path), out_path, certificate_date)
 
-        logger.add(dni_str, codigo_alumno, nombre, "OK", "", out_path.name)
+        status = "OK"
+        reason = ""
+        if observed_courses:
+            status = "OBSERVADO"
+            reason = "Cursos con nota 0 o sin nota: {0}".format("; ".join(observed_courses))
+        logger.add(dni_str, codigo_alumno, nombre, status, reason, out_path.name)
         processed_students += 1
         if progress_cb:
             progress_cb(processed_students, total_students)
